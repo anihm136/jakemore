@@ -1,0 +1,9 @@
+[project]
+name = "jakemore"
+version = "0.1.0"
+description = "A clean, minimal JAX implementation of Andrej Karpathy's makemore (Part 1)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "jax>=0.4.0",
+]
