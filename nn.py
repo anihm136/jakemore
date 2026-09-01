@@ -1,6 +1,6 @@
 import os
-import time
 import pickle
+import time
 from dataclasses import dataclass
 from typing import Optional
 import jax
@@ -12,6 +12,15 @@ from common import (
     create_grain_loader,
     itos,
     load_names,
+)
+from layers import (
+    BatchNorm1d,
+    Embedding,
+    Flatten,
+    Linear,
+    OneHot,
+    Sequential,
+    Tanh,
 )
 
 
@@ -29,7 +38,11 @@ class NNConfig:
     lr_decay_factor: float = 0.1
     num_steps: int = 10000
     batch_size: int = 32
-    reg_weight: float = 0.01  # L2 regularization weight
+    reg_weight: float = 0.0  # L2 regularization weight
+    use_kaiming: bool = True
+    use_batchnorm: bool = True
+    bn_momentum: float = 0.001
+    bn_eps: float = 1e-5
     train_ratio: float = 0.8
     seed: int = 0
     num_samples: int = 5
@@ -37,122 +50,125 @@ class NNConfig:
     log_interval: int = 200
 
 
-def init_mlp_params(
-    key: jax.Array,
-    context_len: int,
-    vocab_size: int,
-    hidden_dim: int,
-    emb_size: Optional[int],
-) -> dict[str, jnp.ndarray]:
-    key_emb, key_w1, key_w2 = jax.random.split(key, 3)
+def build_mlp(config: NNConfig) -> Sequential:
+    """Constructs a modular Sequential MLP model based on NNConfig."""
+    context_len = config.ngram_size - 1
+    layers = []
 
-    model: dict[str, jnp.ndarray] = {}
-    if emb_size is not None:
-        model["emb"] = jax.random.normal(key_emb, (vocab_size, emb_size))
-        in_dim = context_len * emb_size
+    if config.emb_size is not None:
+        layers.append(Embedding(VOCAB_SIZE, config.emb_size))
+        in_dim = context_len * config.emb_size
     else:
-        in_dim = context_len * vocab_size
+        layers.append(OneHot(VOCAB_SIZE))
+        in_dim = context_len * VOCAB_SIZE
 
-    model["W1"] = jax.random.normal(key_w1, (in_dim, hidden_dim))
-    model["b1"] = jnp.zeros((hidden_dim,), dtype=jnp.float32)
+    layers.append(Flatten())
 
-    model["W2"] = jax.random.normal(key_w2, (hidden_dim, vocab_size))
-    model["b2"] = jnp.zeros((vocab_size,), dtype=jnp.float32)
+    kaiming_scale = (
+        (5 / 3) / (in_dim**0.5) if config.use_kaiming else (1.0 / (in_dim**0.5))
+    )
 
-    return model
+    # When followed by BatchNorm, Linear bias is redundant and omitted
+    layers.append(
+        Linear(
+            in_features=in_dim,
+            out_features=config.hidden_dim,
+            bias=not config.use_batchnorm,
+            weight_scale=kaiming_scale,
+        )
+    )
 
-
-def forward(x: jnp.ndarray, model: dict[str, jnp.ndarray]) -> jnp.ndarray:
-    """Computes unnormalized logits for a single context sequence of token IDs."""
-    if "emb" in model:
-        h_in = model["emb"][x]
-    else:
-        h_in = jax.nn.one_hot(
-            x, num_classes=model["W1"].shape[0] // len(x), dtype=jnp.float32
+    if config.use_batchnorm:
+        layers.append(
+            BatchNorm1d(
+                num_features=config.hidden_dim,
+                eps=config.bn_eps,
+                momentum=config.bn_momentum,
+            )
         )
 
-    h_in = h_in.reshape(-1)
-    h = jnp.tanh(h_in @ model["W1"] + model["b1"])
-    logits = h @ model["W2"] + model["b2"]
-    return logits
+    layers.append(Tanh())
 
-
-def forward_batch(x_batch: jnp.ndarray, model: dict[str, jnp.ndarray]) -> jnp.ndarray:
-    """Vectorized forward pass across a batch using jax.vmap."""
-    return jax.vmap(forward, in_axes=(0, None))(x_batch, model)
-
-
-def loss_fn(
-    model: dict[str, jnp.ndarray],
-    x_batch: jnp.ndarray,
-    y_batch: jnp.ndarray,
-    reg_weight: float,
-) -> jnp.ndarray:
-    """Cross-entropy loss with L2 regularization."""
-    logits = forward_batch(x_batch, model)
-    logprobs = jax.nn.log_softmax(logits, axis=-1)
-    target_logprobs = jnp.take_along_axis(logprobs, y_batch[:, None], axis=1)
-    nll_loss = -jnp.mean(target_logprobs)
-
-    reg_loss = (
-        0.5
-        * (jnp.sum(model["W1"] ** 2) + jnp.sum(model["W2"] ** 2))
-        / (model["W1"].size + model["W2"].size)
+    # Output projection to vocabulary logits
+    layers.append(
+        Linear(
+            in_features=config.hidden_dim,
+            out_features=VOCAB_SIZE,
+            bias=True,
+            weight_scale=0.01,
+        )
     )
-    return nll_loss + reg_weight * reg_loss
+
+    return Sequential(layers)
 
 
-@jax.jit
-def train_step(
-    model: dict[str, jnp.ndarray],
-    x_batch: jnp.ndarray,
-    y_batch: jnp.ndarray,
-    lr: float,
-    reg_weight: float,
-) -> tuple[dict[str, jnp.ndarray], jnp.ndarray]:
-    """Single JIT-compiled optimization step."""
-    loss, grads = jax.value_and_grad(loss_fn)(model, x_batch, y_batch, reg_weight)
-    new_model = jax.tree.map(lambda p, g: p - lr * g, model, grads)
-    return new_model, loss
+def make_train_step(model: Sequential):
+    """Creates a JIT-compiled train step closure for a modular Sequential model."""
 
+    @jax.jit
+    def step(
+        params: list[dict[str, jnp.ndarray]],
+        state: list[dict[str, jnp.ndarray]],
+        x_batch: jnp.ndarray,
+        y_batch: jnp.ndarray,
+        lr: float,
+        reg_weight: float,
+    ) -> tuple[list[dict[str, jnp.ndarray]], list[dict[str, jnp.ndarray]], jnp.ndarray]:
+        def loss_fn(p):
+            logits, new_s = model(p, state, x_batch, training=True)
+            logprobs = jax.nn.log_softmax(logits, axis=-1)
+            target_logprobs = jnp.take_along_axis(logprobs, y_batch[:, None], axis=1)
+            nll = -jnp.mean(target_logprobs)
+            l2_weights = [
+                0.5 * jnp.sum(layer_p["w"] ** 2) / layer_p["w"].size
+                for layer_p in p
+                if "w" in layer_p
+            ]
+            l2_loss = sum(l2_weights) if l2_weights else 0.0
+            return nll + reg_weight * l2_loss, new_s
 
-@jax.jit
-def eval_batch_nll(
-    model: dict[str, jnp.ndarray], x_batch: jnp.ndarray, y_batch: jnp.ndarray
-) -> jnp.ndarray:
-    """Computes total NLL sum for a batch."""
-    logits = forward_batch(x_batch, model)
-    logprobs = jax.nn.log_softmax(logits, axis=-1)
-    target_logprobs = jnp.take_along_axis(logprobs, y_batch[:, None], axis=1)
-    return -jnp.sum(target_logprobs)
+        (loss, new_state), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
+        new_params = jax.tree.map(lambda p, g: p - lr * g, params, grads)
+        return new_params, new_state, loss
+
+    return step
 
 
 def evaluate(
-    model: dict[str, jnp.ndarray],
+    model: Sequential,
+    params: list[dict[str, jnp.ndarray]],
+    state: list[dict[str, jnp.ndarray]],
     xs: jnp.ndarray,
     ys: jnp.ndarray,
     batch_size: int = 1024,
 ) -> tuple[float, float]:
-    """Evaluates NLL and perplexity in batches over a dataset split."""
+    """Evaluates NLL and perplexity over dataset splits in batches."""
     total_nll = 0.0
     n_samples = xs.shape[0]
+
     for i in range(0, n_samples, batch_size):
         xb = xs[i : i + batch_size]
         yb = ys[i : i + batch_size]
-        total_nll += float(eval_batch_nll(model, xb, yb))
+        logits, _ = model(params, state, xb, training=False)
+        logprobs = jax.nn.log_softmax(logits, axis=-1)
+        target_logprobs = jnp.take_along_axis(logprobs, yb[:, None], axis=1)
+        total_nll += float(-jnp.sum(target_logprobs))
+
     mean_nll = total_nll / n_samples
     perplexity = float(jnp.exp(mean_nll))
     return mean_nll, perplexity
 
 
 def sample_nn(
-    model: dict[str, jnp.ndarray],
+    model: Sequential,
+    params: list[dict[str, jnp.ndarray]],
+    state: list[dict[str, jnp.ndarray]],
     key: jax.Array,
     context_len: int,
     num_samples: int = 10,
     max_length: int = 20,
 ) -> list[str]:
-    """Generates names autoregressively from the neural network."""
+    """Generates names autoregressively from the network."""
     generated_names = []
     for _ in range(num_samples):
         cur_tokens = [0] * context_len
@@ -160,7 +176,7 @@ def sample_nn(
         for _ in range(max_length):
             key, subkey = jax.random.split(key)
             context = jnp.array(cur_tokens[-context_len:], dtype=jnp.int32)
-            logits = forward(context, model)
+            logits, _ = model(params, state, context, training=False)
             next_token = int(jax.random.categorical(subkey, logits))
             if next_token == 0:
                 break
@@ -194,23 +210,23 @@ def main(config: NNConfig = NNConfig()):
     )
     print(f"Hidden Dim: {config.hidden_dim} (tanh)")
     print(
+        f"BatchNorm:  {'Enabled (alpha=' + str(config.bn_momentum) + ')' if config.use_batchnorm else 'Disabled'}"
+    )
+    print(
         f"LR: {config.learning_rate} (decay {config.lr_decay_factor}x @ {int(config.lr_decay_step * 100)}%) | Steps: {config.num_steps:,} | Batch: {config.batch_size}\n"
     )
 
-    # 2. Initialize parameters
+    # 2. Build modular model and initialize parameters and state
+    model = build_mlp(config)
     init_key = jax.random.key(config.seed)
     init_key, master_key = jax.random.split(init_key)
-    model = init_mlp_params(
-        init_key,
-        context_len=config.ngram_size - 1,
-        emb_size=config.emb_size,
-        hidden_dim=config.hidden_dim,
-        vocab_size=VOCAB_SIZE,
-    )
-    param_count = sum(p.size for p in jax.tree.flatten(model)[0])
+    params, state = model.init(init_key)
+    param_count = model.param_count(params)
     print(f"Model Parameters: {param_count:,}\n")
 
-    # 3. Train network using Grain DataLoader
+    # 3. Create JIT-compiled train step
+    step_fn = make_train_step(model)
+
     train_loader = create_grain_loader(
         train_xs,
         train_ys,
@@ -233,8 +249,9 @@ def main(config: NNConfig = NNConfig()):
             else config.learning_rate * config.lr_decay_factor
         )
 
-        model, loss = train_step(
-            model,
+        params, state, loss = step_fn(
+            params,
+            state,
             xb,
             yb,
             lr=lr,
@@ -250,8 +267,12 @@ def main(config: NNConfig = NNConfig()):
     train_time = stop - start
 
     # 4. Evaluate NLL & Perplexity
-    train_nll, train_perplexity = evaluate(model, train_xs, train_ys)
-    test_nll, test_perplexity = evaluate(model, test_xs, test_ys)
+    train_nll, train_perplexity = evaluate(
+        model, params, state, train_xs, train_ys
+    )
+    test_nll, test_perplexity = evaluate(
+        model, params, state, test_xs, test_ys
+    )
 
     print(f"\nTrain Time:         {train_time:.2f} s")
     print(
@@ -265,6 +286,8 @@ def main(config: NNConfig = NNConfig()):
     master_key, sample_key = jax.random.split(master_key)
     generated = sample_nn(
         model,
+        params,
+        state,
         sample_key,
         context_len=config.ngram_size - 1,
         num_samples=config.num_samples,
@@ -275,11 +298,12 @@ def main(config: NNConfig = NNConfig()):
     for idx, name in enumerate(generated, start=1):
         print(f"  {idx:2d}. {name}")
 
-    # 6. Save model
+    # 6. Save model checkpoint
     os.makedirs(config.save_dir, exist_ok=True)
     save_path = os.path.join(config.save_dir, "nn_model.pkl")
     model_data = {
-        "model": model,
+        "params": params,
+        "state": state,
         "config": config,
         "train_nll": train_nll,
         "train_perplexity": train_perplexity,

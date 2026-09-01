@@ -28,7 +28,7 @@ class NgramConfig:
 
 
 def fit_ngram_counts(
-    xs: jnp.ndarray, ys: jnp.ndarray, ngram_size: int, vocab_size: int
+    xs: jnp.ndarray, ys: jnp.ndarray, ngram_size: int, vocab_size: int = VOCAB_SIZE
 ) -> jnp.ndarray:
     """Builds the (27, ... 27) count tensor from token transitions in a vectorized pass."""
     ngrams = jnp.column_stack([xs, ys])
@@ -39,7 +39,11 @@ def fit_ngram_counts(
 
 
 def evaluate_nll(
-    logprobs: jnp.ndarray, xs: jnp.ndarray, ys: jnp.ndarray, ngram_size: int, vocab_size
+    logprobs: jnp.ndarray,
+    xs: jnp.ndarray,
+    ys: jnp.ndarray,
+    ngram_size: int,
+    vocab_size: int = VOCAB_SIZE,
 ) -> tuple[float, float]:
     """Computes Negative Log-Likelihood and Perplexity across transitions."""
     ngrams = jnp.column_stack([xs, ys])
