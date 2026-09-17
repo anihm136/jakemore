@@ -35,6 +35,23 @@ def test_linear_shapes_and_bias():
     assert out.shape == (4, 16)
 
 
+def test_linear_weight_scale_options():
+    lin_none = Linear(in_features=16, out_features=32, weight_scale=None)
+    assert lin_none.weight_scale == 1.0
+
+    lin_fan_in = Linear(in_features=16, out_features=32, weight_scale="fan_in")
+    assert np.isclose(lin_fan_in.weight_scale, 1.0 / 4.0)
+
+    lin_kaiming = Linear(in_features=16, out_features=32, weight_scale="kaiming")
+    assert np.isclose(lin_kaiming.weight_scale, (5.0 / 3.0) / 4.0)
+
+    lin_float = Linear(in_features=16, out_features=32, weight_scale=0.05)
+    assert np.isclose(lin_float.weight_scale, 0.05)
+
+    with pytest.raises(ValueError):
+        Linear(in_features=16, out_features=32, weight_scale="invalid")
+
+
 def test_batchnorm_training_normalization():
     key = jax.random.key(0)
     bn = BatchNorm1d(num_features=4, eps=1e-5, momentum=0.001)

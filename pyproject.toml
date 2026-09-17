@@ -9,6 +9,8 @@ dependencies = [
     "grain>=0.2.13",
     "jax>=0.4.0",
     "matplotlib>=3.10.9",
+    "tensorboard>=2.14.0",
+    "tensorboardx>=2.6.0",
 ]
 
 [dependency-groups]

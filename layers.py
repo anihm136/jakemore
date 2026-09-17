@@ -87,9 +87,32 @@ class Flatten:
         x: jnp.ndarray,
         **kwargs,
     ) -> tuple[jnp.ndarray, dict[str, jnp.ndarray]]:
-        if x.ndim >= 2:
-            return x.reshape(x.shape[:-2] + (-1,)), state
-        return x.ravel(), state
+        return x.reshape(x.shape[:-2] + (-1,)), state
+
+
+class Wave:
+    """Creates wavenet layer"""
+
+    def __init__(self, wave_size: int):
+        self.wave_size = wave_size
+
+    def init(
+        self, key: jax.Array
+    ) -> tuple[dict[str, jnp.ndarray], dict[str, jnp.ndarray]]:
+        return {}, {}
+
+    def __call__(
+        self,
+        params: dict[str, jnp.ndarray],
+        state: dict[str, jnp.ndarray],
+        x: jnp.ndarray,
+        **kwargs,
+    ) -> tuple[jnp.ndarray, dict[str, jnp.ndarray]]:
+        B, T, C = x.shape[:-2], x.shape[-2], x.shape[-1]
+        out = x.reshape(B + (T // self.wave_size,) + (C * self.wave_size,))
+        if out.shape[-2] == 1:
+            out = jnp.squeeze(out, -2)
+        return out, state
 
 
 class Linear:
@@ -100,12 +123,21 @@ class Linear:
         in_features: int,
         out_features: int,
         bias: bool = True,
-        weight_scale: float = 1.0,
+        weight_scale: float | str | None = None,
     ):
         self.in_features = in_features
         self.out_features = out_features
         self.bias = bias
-        self.weight_scale = weight_scale
+        if weight_scale is None:
+            self.weight_scale = 1.0
+        elif weight_scale == "fan_in":
+            self.weight_scale = 1.0 / (in_features**0.5)
+        elif weight_scale == "kaiming":
+            self.weight_scale = (5.0 / 3.0) / (in_features**0.5)
+        elif isinstance(weight_scale, (int, float)):
+            self.weight_scale = float(weight_scale)
+        else:
+            raise ValueError(f"Unsupported weight_scale: {weight_scale}")
 
     def init(
         self, key: jax.Array
@@ -246,6 +278,22 @@ class Sequential:
         """Returns total number of scalar parameters in the model."""
         return sum(p.size for p in jax.tree.leaves(params))
 
+    def forward_with_intermediates(
+        self,
+        params: list[dict[str, jnp.ndarray]],
+        state: list[dict[str, jnp.ndarray]],
+        x: jnp.ndarray,
+        training: bool = False,
+    ) -> tuple[jnp.ndarray, list[tuple[str, jnp.ndarray]]]:
+        """Passes input through layers and records output of each layer with its name."""
+        intermediates = []
+        h = x
+        for idx, (layer, p, s) in enumerate(zip(self.layers, params, state)):
+            layer_name = f"{layer.__class__.__name__}_{idx}"
+            h, _ = layer(p, s, h, training=training)
+            intermediates.append((layer_name, h))
+        return h, intermediates
+
 
 def calibrate_batchnorm_stats(
     params: list[dict[str, jnp.ndarray]],
@@ -266,7 +314,7 @@ def calibrate_batchnorm_stats(
             h = batch
             for prev_idx in range(layer_idx):
                 h, _ = model.layers[prev_idx](
-                    params[prev_idx], state[prev_idx], h, training=False
+                    params[prev_idx], new_state[prev_idx], h, training=False
                 )
             all_features.append(h)
 

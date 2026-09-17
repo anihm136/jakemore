@@ -4,6 +4,7 @@ import pickle
 from dataclasses import dataclass
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from common import (
     VOCAB_SIZE,
@@ -33,7 +34,9 @@ def fit_ngram_counts(
     """Builds the (27, ... 27) count tensor from token transitions in a vectorized pass."""
     ngrams = jnp.column_stack([xs, ys])
     dims = (vocab_size,) * ngram_size
-    flat_indices = jnp.ravel_multi_index(ngrams.T, dims=dims, mode="clip")
+    flat_indices = jnp.ravel_multi_index(
+        ngrams.T, dims=dims, mode="clip", dtype=np.min_scalar_type(np.prod(dims))
+    )
     counts_flat = jnp.bincount(flat_indices, length=vocab_size**ngram_size)
     return counts_flat.reshape(dims).astype(jnp.float32)
 
@@ -71,7 +74,7 @@ def sample(
             key, subkey = jax.random.split(key)
             context = tuple(cur_tokens[-(ngram_size - 1) :])
             next_probs = probs[context]
-            next_token = int(jax.random.categorical(subkey, jnp.log(next_probs)))
+            next_token = jnp.argmax(jax.random.multinomial(subkey, 1, next_probs)).item()
             if next_token == 0:
                 break
             out_chars.append(itos(next_token))
@@ -87,6 +90,10 @@ def main(config: NgramConfig = NgramConfig()):
 
     # 1. Load dataset & build tokenized n-grams
     names = load_names(config.data_path)
+    master_key = jax.random.key(config.seed)
+    master_key, shuffle_key = jax.random.split(master_key)
+    perm = jax.random.permutation(shuffle_key, len(names))
+    names = [names[int(i)] for i in perm]
     xs, ys = build_tokenized_dataset(names, ngram_size=config.ngram_size)
 
     # Split dataset
@@ -127,7 +134,6 @@ def main(config: NgramConfig = NgramConfig()):
     )
 
     # 4. Generate sample names
-    master_key = jax.random.key(config.seed)
     generated = sample(
         probs,
         master_key,

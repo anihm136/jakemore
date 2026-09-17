@@ -12,8 +12,10 @@ from common import (
     load_names,
     stoi,
 )
+import layers
+import mlp
 import ngrams
-import nn
+import wavenet
 
 
 def test_tokenization_roundtrip():
@@ -94,8 +96,8 @@ def test_modular_mlp_param_shapes():
     key = jax.random.key(0)
 
     # Embedding table mode with batchnorm
-    config_emb = nn.NNConfig(ngram_size=3, emb_size=10, hidden_dim=64, use_batchnorm=True)
-    model_emb = nn.build_mlp(config_emb)
+    config_emb = mlp.MLPConfig(ngram_size=3, emb_size=10, hidden_dim=64, use_batchnorm=True)
+    model_emb = mlp.build_mlp(config_emb)
     params_emb, state_emb = model_emb.init(key)
 
     # Embedding: weight (27, 10)
@@ -117,8 +119,8 @@ def test_modular_mlp_param_shapes():
     assert params_emb[5]["b"].shape == (VOCAB_SIZE,)
 
     # One-hot mode without batchnorm
-    config_onehot = nn.NNConfig(ngram_size=3, emb_size=None, hidden_dim=64, use_batchnorm=False)
-    model_onehot = nn.build_mlp(config_onehot)
+    config_onehot = mlp.MLPConfig(ngram_size=3, emb_size=None, hidden_dim=64, use_batchnorm=False)
+    model_onehot = mlp.build_mlp(config_onehot)
     params_onehot, _ = model_onehot.init(key)
     # OneHot: {}
     assert params_onehot[0] == {}
@@ -131,8 +133,8 @@ def test_modular_mlp_param_shapes():
 
 def test_modular_mlp_forward():
     key = jax.random.key(0)
-    config = nn.NNConfig(ngram_size=3, emb_size=10, hidden_dim=64, use_batchnorm=True)
-    model = nn.build_mlp(config)
+    config = mlp.MLPConfig(ngram_size=3, emb_size=10, hidden_dim=64, use_batchnorm=True)
+    model = mlp.build_mlp(config)
     params, state = model.init(key)
 
     # Single example forward
@@ -147,24 +149,24 @@ def test_modular_mlp_forward():
 
 
 def test_modular_mlp_batchnorm_construction():
-    config_bn = nn.NNConfig(ngram_size=3, emb_size=10, hidden_dim=64, use_batchnorm=True)
-    model_bn = nn.build_mlp(config_bn)
+    config_bn = mlp.MLPConfig(ngram_size=3, emb_size=10, hidden_dim=64, use_batchnorm=True)
+    model_bn = mlp.build_mlp(config_bn)
 
     # Layers: Embedding, Flatten, Linear(bias=False), BatchNorm1d, Tanh, Linear(bias=True)
     assert len(model_bn.layers) == 6
-    assert isinstance(model_bn.layers[2], nn.Linear)
+    assert isinstance(model_bn.layers[2], layers.Linear)
     assert model_bn.layers[2].bias is False
-    assert isinstance(model_bn.layers[3], nn.BatchNorm1d)
+    assert isinstance(model_bn.layers[3], layers.BatchNorm1d)
     assert model_bn.layers[3].momentum == 0.001
 
-    config_nobn = nn.NNConfig(ngram_size=3, emb_size=10, hidden_dim=64, use_batchnorm=False)
-    model_nobn = nn.build_mlp(config_nobn)
+    config_nobn = mlp.MLPConfig(ngram_size=3, emb_size=10, hidden_dim=64, use_batchnorm=False)
+    model_nobn = mlp.build_mlp(config_nobn)
     assert len(model_nobn.layers) == 5
     assert model_nobn.layers[2].bias is True
 
 
 def test_modular_mlp_train_and_sample():
-    config = nn.NNConfig(
+    config = mlp.MLPConfig(
         ngram_size=3,
         emb_size=10,
         hidden_dim=32,
@@ -172,11 +174,11 @@ def test_modular_mlp_train_and_sample():
         bn_momentum=0.001,
         learning_rate=0.1,
     )
-    model = nn.build_mlp(config)
+    model = mlp.build_mlp(config)
     key = jax.random.key(0)
     params, state = model.init(key)
 
-    step_fn = nn.make_train_step(model)
+    step_fn = mlp.make_train_step(model)
 
     x_batch = jnp.array([[0, 5], [5, 13], [13, 1], [1, 0]], dtype=jnp.int32)
     y_batch = jnp.array([5, 13, 1, 0], dtype=jnp.int32)
@@ -190,7 +192,7 @@ def test_modular_mlp_train_and_sample():
     assert float(final_loss) < float(initial_loss)
 
     # Test sampling with modular model
-    sample_names = nn.sample_nn(
+    sample_names = mlp.sample_nn(
         model,
         p_cur,
         s_cur,
@@ -203,7 +205,33 @@ def test_modular_mlp_train_and_sample():
     assert all(isinstance(n, str) for n in sample_names)
 
     # Test evaluate with modular model
-    mean_nll, perplexity = nn.evaluate(model, p_cur, s_cur, x_batch, y_batch, batch_size=2)
+    mean_nll, perplexity = mlp.evaluate(model, p_cur, s_cur, x_batch, y_batch, batch_size=2)
     assert mean_nll > 0.0
     assert perplexity >= 1.0
+
+
+def test_wavenet_train_and_sample():
+    config = wavenet.WavenetConfig(
+        ngram_size=9,
+        emb_size=8,
+        hidden_dim=16,
+        wave_size=2,
+        learning_rate=0.1,
+    )
+    model = wavenet.build_wavenet(config)
+    key = jax.random.key(0)
+    params, state = model.init(key)
+
+    step_fn = wavenet.make_train_step(model)
+
+    x_batch = jnp.zeros((4, 8), dtype=jnp.int32)
+    y_batch = jnp.ones((4,), dtype=jnp.int32)
+
+    p_cur, s_cur = params, state
+    p_cur, s_cur, initial_loss = step_fn(p_cur, s_cur, x_batch, y_batch, lr=0.1)
+
+    for _ in range(10):
+        p_cur, s_cur, final_loss = step_fn(p_cur, s_cur, x_batch, y_batch, lr=0.1)
+
+    assert float(final_loss) < float(initial_loss)
 

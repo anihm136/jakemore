@@ -14,6 +14,7 @@ from common import (
     load_names,
 )
 from layers import (
+    Layer,
     BatchNorm1d,
     Embedding,
     Flatten,
@@ -21,39 +22,45 @@ from layers import (
     OneHot,
     Sequential,
     Tanh,
+    calibrate_batchnorm_stats,
 )
+from telemetry import TensorBoardLogger, compute_diagnostics
 
 
 @dataclass
-class NNConfig:
+class MLPConfig:
     """Configuration for the MLP character language model."""
 
     data_path: str = "names.txt"
     save_dir: str = "models"
-    ngram_size: int = 4
+    ngram_size: int = 9
     emb_size: Optional[int] = 10  # None for one-hot; int for embedding table
     hidden_dim: int = 200
     learning_rate: float = 0.1
     lr_decay_step: float = 0.8  # Fraction of steps after which LR is decayed
     lr_decay_factor: float = 0.1
-    num_steps: int = 10000
+    num_steps: int = 100000
     batch_size: int = 32
-    reg_weight: float = 0.0  # L2 regularization weight
+    reg_weight: float = 0.01  # L2 regularization weight
     use_kaiming: bool = True
     use_batchnorm: bool = True
     bn_momentum: float = 0.001
     bn_eps: float = 1e-5
+    use_tensorboard: bool = True
+    tb_log_dir: str = "runs/mlp"
+    tb_log_interval: int = 50
+    tb_hist_interval: int = 200
     train_ratio: float = 0.8
     seed: int = 0
-    num_samples: int = 5
+    num_samples: int = 10
     max_length: int = 20
     log_interval: int = 200
 
 
-def build_mlp(config: NNConfig) -> Sequential:
-    """Constructs a modular Sequential MLP model based on NNConfig."""
+def build_mlp(config: MLPConfig) -> Sequential:
+    """Constructs a modular Sequential MLP model based on MLPConfig."""
     context_len = config.ngram_size - 1
-    layers = []
+    layers: list[Layer] = []
 
     if config.emb_size is not None:
         layers.append(Embedding(VOCAB_SIZE, config.emb_size))
@@ -64,9 +71,7 @@ def build_mlp(config: NNConfig) -> Sequential:
 
     layers.append(Flatten())
 
-    kaiming_scale = (
-        (5 / 3) / (in_dim**0.5) if config.use_kaiming else (1.0 / (in_dim**0.5))
-    )
+    weight_scale = "kaiming" if config.use_kaiming else "fan_in"
 
     # When followed by BatchNorm, Linear bias is redundant and omitted
     layers.append(
@@ -74,7 +79,7 @@ def build_mlp(config: NNConfig) -> Sequential:
             in_features=in_dim,
             out_features=config.hidden_dim,
             bias=not config.use_batchnorm,
-            weight_scale=kaiming_scale,
+            weight_scale=weight_scale,
         )
     )
 
@@ -102,7 +107,7 @@ def build_mlp(config: NNConfig) -> Sequential:
     return Sequential(layers)
 
 
-def make_train_step(model: Sequential):
+def make_train_step(model: Sequential, return_grads: bool = False):
     """Creates a JIT-compiled train step closure for a modular Sequential model."""
 
     @jax.jit
@@ -113,14 +118,14 @@ def make_train_step(model: Sequential):
         y_batch: jnp.ndarray,
         lr: float,
         reg_weight: float,
-    ) -> tuple[list[dict[str, jnp.ndarray]], list[dict[str, jnp.ndarray]], jnp.ndarray]:
+    ):
         def loss_fn(p):
             logits, new_s = model(p, state, x_batch, training=True)
             logprobs = jax.nn.log_softmax(logits, axis=-1)
             target_logprobs = jnp.take_along_axis(logprobs, y_batch[:, None], axis=1)
             nll = -jnp.mean(target_logprobs)
             l2_weights = [
-                0.5 * jnp.sum(layer_p["w"] ** 2) / layer_p["w"].size
+                0.5 * jnp.sum(layer_p["w"] ** 2)
                 for layer_p in p
                 if "w" in layer_p
             ]
@@ -129,6 +134,8 @@ def make_train_step(model: Sequential):
 
         (loss, new_state), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
         new_params = jax.tree.map(lambda p, g: p - lr * g, params, grads)
+        if return_grads:
+            return new_params, new_state, loss, grads
         return new_params, new_state, loss
 
     return step
@@ -186,22 +193,30 @@ def sample_nn(
     return generated_names
 
 
-def main(config: NNConfig = NNConfig()):
+def main(config: MLPConfig = MLPConfig()):
     print("=" * 60)
     print(f"  jakemore: {config.ngram_size}-gram MLP Language Model (JAX)")
     print("=" * 60)
 
-    # 1. Load dataset & build tokenized n-grams
+    # 1. Load dataset, shuffle names with JAX PRNG, & build tokenized n-grams
     names = load_names(config.data_path)
-    xs, ys = build_tokenized_dataset(names, ngram_size=config.ngram_size)
+    base_key = jax.random.key(config.seed)
+    shuffle_key, init_key, master_key = jax.random.split(base_key, 3)
 
-    # Train / test split
-    split_idx = int(round(xs.shape[0] * config.train_ratio))
-    train_xs, train_ys = xs[:split_idx], ys[:split_idx]
-    test_xs, test_ys = xs[split_idx:], ys[split_idx:]
+    perm = jax.random.permutation(shuffle_key, len(names))
+    names = [names[int(i)] for i in perm]
+
+    split_idx = int(round(len(names) * config.train_ratio))
+    train_xs, train_ys = build_tokenized_dataset(
+        names[:split_idx], ngram_size=config.ngram_size
+    )
+    test_xs, test_ys = build_tokenized_dataset(
+        names[split_idx:], ngram_size=config.ngram_size
+    )
+    total_transitions = train_xs.shape[0] + test_xs.shape[0]
 
     print(
-        f"Loaded {len(names):,} names ({xs.shape[0]:,} {config.ngram_size}-gram transitions)"
+        f"Loaded {len(names):,} names ({total_transitions:,} {config.ngram_size}-gram transitions)"
     )
     print(f"Train set: {train_xs.shape[0]:,} transitions")
     print(f"Test set:  {test_xs.shape[0]:,} transitions")
@@ -218,14 +233,17 @@ def main(config: NNConfig = NNConfig()):
 
     # 2. Build modular model and initialize parameters and state
     model = build_mlp(config)
-    init_key = jax.random.key(config.seed)
-    init_key, master_key = jax.random.split(init_key)
     params, state = model.init(init_key)
     param_count = model.param_count(params)
     print(f"Model Parameters: {param_count:,}\n")
 
-    # 3. Create JIT-compiled train step
-    step_fn = make_train_step(model)
+    # 3. Create JIT-compiled train step & optional TensorBoard logger
+    step_fn = make_train_step(model, return_grads=config.use_tensorboard)
+
+    tb_logger = None
+    if config.use_tensorboard:
+        tb_logger = TensorBoardLogger(log_dir=config.tb_log_dir)
+        print(f"TensorBoard: Enabled -> logdir: '{config.tb_log_dir}'")
 
     train_loader = create_grain_loader(
         train_xs,
@@ -249,14 +267,43 @@ def main(config: NNConfig = NNConfig()):
             else config.learning_rate * config.lr_decay_factor
         )
 
-        params, state, loss = step_fn(
-            params,
-            state,
-            xb,
-            yb,
-            lr=lr,
-            reg_weight=config.reg_weight,
-        )
+        if config.use_tensorboard:
+            params, state, loss, grads = step_fn(
+                params,
+                state,
+                xb,
+                yb,
+                lr=lr,
+                reg_weight=config.reg_weight,
+            )
+        else:
+            params, state, loss = step_fn(
+                params,
+                state,
+                xb,
+                yb,
+                lr=lr,
+                reg_weight=config.reg_weight,
+            )
+
+        # TensorBoard telemetry logging
+        if tb_logger is not None:
+            should_log_diag = (
+                step % config.tb_log_interval == 0 or step == config.num_steps
+            )
+            should_log_hist = (
+                step % config.tb_hist_interval == 0 or step == config.num_steps
+            )
+            diag = None
+            if should_log_diag:
+                diag = compute_diagnostics(model, params, state, grads, xb, lr)
+            tb_logger.log_step(
+                step=step,
+                loss=float(loss),
+                lr=lr,
+                diagnostics=diag,
+                log_histograms=should_log_hist,
+            )
 
         if step % config.log_interval == 0 or step == config.num_steps:
             print(
@@ -266,13 +313,11 @@ def main(config: NNConfig = NNConfig()):
     stop = time.perf_counter()
     train_time = stop - start
 
-    # 4. Evaluate NLL & Perplexity
-    train_nll, train_perplexity = evaluate(
-        model, params, state, train_xs, train_ys
-    )
-    test_nll, test_perplexity = evaluate(
-        model, params, state, test_xs, test_ys
-    )
+    # 4. Calibrate BatchNorm statistics & Evaluate NLL / Perplexity
+    if config.use_batchnorm:
+        state = calibrate_batchnorm_stats(params, state, model, [train_xs])
+    train_nll, train_perplexity = evaluate(model, params, state, train_xs, train_ys)
+    test_nll, test_perplexity = evaluate(model, params, state, test_xs, test_ys)
 
     print(f"\nTrain Time:         {train_time:.2f} s")
     print(
@@ -282,7 +327,22 @@ def main(config: NNConfig = NNConfig()):
         f"Test NLL:           {test_nll:.4f} | Test Perplexity:  {test_perplexity:.4f}"
     )
 
-    # 5. Generate sample names
+    # 5. Log evaluation metrics to TensorBoard and close
+    if tb_logger is not None:
+        tb_logger.log_scalars(
+            {
+                "eval/train_nll": train_nll,
+                "eval/train_perplexity": train_perplexity,
+                "eval/test_nll": test_nll,
+                "eval/test_perplexity": test_perplexity,
+            },
+            step=config.num_steps,
+        )
+        tb_logger.close()
+        print(f"\nTensorBoard logs written to '{config.tb_log_dir}/'")
+        print(f"Run dashboard via: uv run tensorboard --logdir {config.tb_log_dir}")
+
+    # 6. Generate sample names
     master_key, sample_key = jax.random.split(master_key)
     generated = sample_nn(
         model,
@@ -298,9 +358,9 @@ def main(config: NNConfig = NNConfig()):
     for idx, name in enumerate(generated, start=1):
         print(f"  {idx:2d}. {name}")
 
-    # 6. Save model checkpoint
+    # 7. Save model checkpoint
     os.makedirs(config.save_dir, exist_ok=True)
-    save_path = os.path.join(config.save_dir, "nn_model.pkl")
+    save_path = os.path.join(config.save_dir, "mlp_model.pkl")
     model_data = {
         "params": params,
         "state": state,
